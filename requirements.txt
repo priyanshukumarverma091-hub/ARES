@@ -1,0 +1,17 @@
+ddgs
+requests
+beautifulsoup4
+trafilatura
+playwright
+pymupdf
+pandas
+reportlab
+python-dotenv
+openai
+Flask
+ddgs
+trafilatura
+openai
+reportlab
+gunicorn
+python-dotenv

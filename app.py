@@ -1,7 +1,10 @@
+import io
 import os
+import time
+import uuid
 import logging
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 
 from flask import (
     Flask,
@@ -19,23 +22,47 @@ import main as engine
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-REPORT_DIR = (BASE_DIR / "reports").resolve()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger("ARES_WEB")
 
+# Research runs in a background thread. Use one Gunicorn worker
+# because the short-lived job and PDF stores are held in memory.
 research_lock = Lock()
+jobs_lock = Lock()
+JOBS = {}
+PDF_REPORTS = {}
 
+JOB_TTL_SECONDS = 60 * 60
+MAX_STORED_JOBS = 20
 
-# =========================================================
-# DATABASE INITIALIZATION
-# =========================================================
-
+# The current engine still uses SQLite internally while collecting
+# source metadata. History is not exposed in the web interface.
 engine.initialize_database()
+
+
+def cleanup_expired_items():
+    now = time.time()
+
+    with jobs_lock:
+        for job_id in list(JOBS):
+            if now - JOBS[job_id].get("created_at", now) > JOB_TTL_SECONDS:
+                JOBS.pop(job_id, None)
+
+        for token in list(PDF_REPORTS):
+            if now - PDF_REPORTS[token].get("created_at", now) > JOB_TTL_SECONDS:
+                PDF_REPORTS.pop(token, None)
+
+        if len(JOBS) > MAX_STORED_JOBS:
+            oldest = sorted(
+                JOBS.items(),
+                key=lambda item: item[1].get("created_at", 0)
+            )
+            for job_id, _ in oldest[:-MAX_STORED_JOBS]:
+                JOBS.pop(job_id, None)
 
 
 # =========================================================
@@ -702,18 +729,6 @@ footer {
     </div>
 
 
-    <div class="card" id="historyCard">
-
-        <div class="card-label">
-            RECENT RESEARCH
-        </div>
-
-        <div id="history">
-            Loading research history...
-        </div>
-
-    </div>
-
 </section>
 
 
@@ -874,8 +889,27 @@ function renderMarkdown(text) {
 // START RESEARCH
 // =========================================================
 
-async function startResearch() {
+async function readJSONResponse(response) {
+    const raw = await response.text();
 
+    if (!raw) {
+        throw new Error(`Server returned an empty response (HTTP ${response.status}).`);
+    }
+
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        throw new Error(`Server returned an invalid response (HTTP ${response.status}).`);
+    }
+}
+
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+async function startResearch() {
     const topic = document.getElementById("topic").value.trim();
 
     if (!topic) {
@@ -896,157 +930,105 @@ async function startResearch() {
     workspace.style.display = "block";
     results.style.display = "none";
     error.style.display = "none";
-
     researchData = null;
 
     button.disabled = true;
     button.textContent = "Researching...";
-
-    workspace.scrollIntoView({
-        behavior: "smooth"
-    });
-
+    workspace.scrollIntoView({ behavior: "smooth" });
 
     const stages = [
-
-        [12, 1, "Searching the web",
-            "Discovering relevant web and academic sources..."],
-
-        [35, 2, "Extracting information",
-            "Collecting article content..."],
-
-        [65, 3, "Analyzing research",
-            "Summarizing and synthesizing evidence..."],
-
-        [90, 4, "Preparing report",
-            "Generating your research PDF..."]
-
+        [12, 1, "Searching the web", "Discovering relevant web and academic sources..."],
+        [35, 2, "Extracting information", "Collecting article content..."],
+        [65, 3, "Analyzing research", "Summarizing and synthesizing evidence..."],
+        [88, 4, "Preparing report", "Finalizing your research results..."]
     ];
 
-
     let stageIndex = 0;
+    setProgress(5, "Starting ARES", "Submitting your research topic...");
+    setStage(1);
 
     const timer = setInterval(() => {
-
-        if (stageIndex < stages.length) {
-
-            const stage = stages[stageIndex];
-
-            setProgress(
-                stage[0],
-                stage[2],
-                stage[3]
-            );
-
-            setStage(stage[1]);
-
-            stageIndex++;
-
-        }
-
-    }, 4000);
-
+        const stage = stages[Math.min(stageIndex, stages.length - 1)];
+        setProgress(stage[0], stage[2], stage[3]);
+        setStage(stage[1]);
+        stageIndex = Math.min(stageIndex + 1, stages.length - 1);
+    }, 5000);
 
     try {
-
-        const response = await fetch("/api/research", {
-
+        const startResponse = await fetch("/api/research", {
             method: "POST",
-
-            headers: {
-                "Content-Type": "application/json"
-            },
-
-            body: JSON.stringify({
-                topic: topic
-            })
-
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ topic })
         });
 
+        const startData = await readJSONResponse(startResponse);
 
-        const data = await response.json();
+        if (!startResponse.ok) {
+            throw new Error(startData.error || "Could not start research.");
+        }
 
+        if (!startData.job_id) {
+            throw new Error("The server did not return a research job ID.");
+        }
 
-        if (!response.ok) {
+        let completedData = null;
 
-            throw new Error(
-                data.error || "Research failed."
+        while (true) {
+            await sleep(2000);
+
+            const statusResponse = await fetch(
+                `/api/research/${encodeURIComponent(startData.job_id)}`,
+                { cache: "no-store" }
             );
 
+            const statusData = await readJSONResponse(statusResponse);
+
+            if (!statusResponse.ok) {
+                throw new Error(statusData.error || "Could not check research status.");
+            }
+
+            if (statusData.status === "failed") {
+                throw new Error(statusData.error || "Research failed.");
+            }
+
+            if (statusData.status === "completed") {
+                completedData = statusData.result;
+                break;
+            }
         }
 
-
-        // FIX: Backend sends report_ready instead of
-        // exposing the absolute report_path.
-
-        if (!data.report_ready) {
-
-            throw new Error(
-                "Research completed, but PDF report was not generated."
-            );
-
+        if (!completedData || !Array.isArray(completedData.articles)) {
+            throw new Error("Research finished but returned incomplete results.");
         }
 
-
-        if (!Array.isArray(data.articles)) {
-            throw new Error("Invalid research sources received.");
+        if (!completedData.stats || typeof completedData.stats !== "object") {
+            throw new Error("Research statistics are missing from the response.");
         }
 
-        if (!data.stats || typeof data.stats !== "object") {
-            throw new Error("Research statistics are missing.");
+        researchData = completedData;
+
+        for (let i = 1; i <= 4; i++) {
+            const element = document.getElementById("stage" + i);
+            element.classList.remove("active");
+            element.classList.add("done");
         }
-
-
-        researchData = data;
-
-        clearInterval(timer);
-
 
         setProgress(
             100,
             "Research completed",
-            `${data.articles.length} sources analyzed in ${data.duration} seconds.`
+            `${completedData.articles.length} sources analyzed in ${completedData.duration} seconds.`
         );
 
-
-        for (let i = 1; i <= 4; i++) {
-
-            const element = document.getElementById("stage" + i);
-
-            element.classList.remove("active");
-            element.classList.add("done");
-
-        }
-
-
-        displayResults(data);
-
-        loadHistory();
-
-    }
-
-    catch (err) {
-
-        clearInterval(timer);
-
-        error.textContent = err.message;
+        displayResults(completedData);
+    } catch (err) {
+        error.textContent = err.message || "An unexpected research error occurred.";
         error.style.display = "block";
-
-        setProgress(
-            0,
-            "Research interrupted",
-            "Please review the error and try again."
-        );
-
-    }
-
-    finally {
-
+        setProgress(0, "Research interrupted", "Please review the error and try again.");
+    } finally {
+        clearInterval(timer);
         button.disabled = false;
         button.textContent = "Start Research →";
-
     }
-
 }
 
 
@@ -1057,6 +1039,11 @@ async function startResearch() {
 function displayResults(data) {
 
     document.getElementById("results").style.display = "block";
+
+    const pdfButton = document.querySelector(".export-btn");
+    if (pdfButton) {
+        pdfButton.style.display = data.pdf_token ? "inline-block" : "none";
+    }
 
     document.getElementById("researchTopic").textContent =
         data.topic || "Untitled research";
@@ -1179,135 +1166,48 @@ function displayResults(data) {
 // =========================================================
 
 async function exportPDF() {
-
-    if (!researchData || !researchData.research_id) {
-        alert("No completed research report available.");
+    if (!researchData || !researchData.pdf_token) {
+        alert("No downloadable PDF is available for this research.");
         return;
     }
 
+    const button = document.querySelector(".export-btn");
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = "Preparing PDF...";
+
     try {
-
-        const response = await fetch("/api/export", {
-
-            method: "POST",
-
-            headers: {
-                "Content-Type": "application/json"
-            },
-
-            body: JSON.stringify({
-                research_id: researchData.research_id
-            })
-
-        });
-
+        const response = await fetch(
+            `/api/export/${encodeURIComponent(researchData.pdf_token)}`
+        );
 
         if (!response.ok) {
-
-            let message = "PDF download failed.";
-
-            try {
-                const data = await response.json();
-                message = data.error || message;
-            } catch (e) {}
-
-            throw new Error(message);
-
+            const data = await readJSONResponse(response);
+            throw new Error(data.error || "PDF download failed.");
         }
-
 
         const blob = await response.blob();
 
+        if (!blob.size) {
+            throw new Error("The generated PDF is empty.");
+        }
+
         const url = URL.createObjectURL(blob);
-
         const link = document.createElement("a");
-
         link.href = url;
         link.download = "ARES_Research_Report.pdf";
 
         document.body.appendChild(link);
-
         link.click();
-
         link.remove();
 
-        URL.revokeObjectURL(url);
-
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+        alert(err.message || "PDF download failed.");
+    } finally {
+        button.disabled = false;
+        button.textContent = originalText;
     }
-
-    catch (err) {
-
-        alert(err.message);
-
-    }
-
-}
-
-
-// =========================================================
-// RESEARCH HISTORY
-// =========================================================
-
-async function loadHistory() {
-
-    try {
-
-        const response = await fetch("/api/history");
-
-        if (!response.ok) {
-            throw new Error("History request failed.");
-        }
-
-        const history = await response.json();
-
-        const container = document.getElementById("history");
-
-        container.replaceChildren();
-
-
-        if (!Array.isArray(history) || !history.length) {
-
-            container.textContent = "No previous research yet.";
-
-            return;
-
-        }
-
-
-        history.forEach(item => {
-
-            const div = document.createElement("div");
-
-            div.className = "history-item";
-
-
-            const title = document.createElement("strong");
-
-            title.textContent = item.topic || "Untitled research";
-
-
-            const date = document.createElement("small");
-
-            date.textContent = item.created_at || "";
-
-
-            div.append(title, date);
-
-            container.appendChild(div);
-
-        });
-
-    }
-
-    catch (err) {
-
-        console.error("History loading failed:", err);
-
-        document.getElementById("history").textContent =
-            "Could not load research history.";
-
-    }
-
 }
 
 
@@ -1334,7 +1234,6 @@ document.getElementById("topic").addEventListener(
 );
 
 
-loadHistory();
 
 </script>
 
@@ -1349,244 +1248,186 @@ loadHistory();
 
 @app.route("/", methods=["GET"])
 def home():
-
     return render_template_string(HTML)
 
 
 # =========================================================
-# RESEARCH API
+# BACKGROUND RESEARCH WORKER
 # =========================================================
 
-@app.route("/api/research", methods=["POST"])
-def research():
-
-    data = request.get_json(silent=True) or {}
-
-    topic = str(data.get("topic", "")).strip()
-
-    if not topic:
-
-        return jsonify({
-            "error": "Research topic is required."
-        }), 400
-
-    if len(topic) > 500:
-
-        return jsonify({
-            "error": "Topic must be under 500 characters."
-        }), 400
-
-
-    if not research_lock.acquire(blocking=False):
-
-        return jsonify({
-            "error": (
-                "Another research task is already running. "
-                "Please wait."
-            )
-        }), 409
-
-
+def run_research_job(job_id, topic):
     try:
-
-        logger.info("Research started: %s", topic)
+        logger.info("Research job %s started: %s", job_id, topic)
 
         result = engine.run_research(topic)
 
-
         if not isinstance(result, dict):
-
-            logger.error(
-                "Invalid engine response type: %s",
-                type(result).__name__
+            raise RuntimeError(
+                "The research engine did not return a structured result."
             )
-
-            return jsonify({
-                "error": (
-                    "The research engine did not return "
-                    "a structured result. Check main.py."
-                )
-            }), 500
-
-
-        # Create a separate response object.
-        # Do not expose the local PDF file path.
 
         result = dict(result)
 
-        report_path = result.get("report_path")
+        # Capture the engine-generated PDF in memory and remove its
+        # temporary disk copy. The download route serves the bytes.
+        report_path = result.pop("report_path", None)
+        pdf_bytes = None
 
-        result["report_ready"] = bool(report_path)
+        if report_path:
+            report_file = Path(report_path).resolve()
+            if report_file.is_file():
+                pdf_bytes = report_file.read_bytes()
+                try:
+                    report_file.unlink()
+                except OSError:
+                    logger.warning("Could not remove temporary PDF: %s", report_file)
 
-        result.pop("report_path", None)
-
-
-        # Ensure expected frontend fields exist.
+        result.pop("research_id", None)
+        result.pop("sources_saved", None)
 
         result.setdefault("articles", [])
-
         result.setdefault("stats", {})
-
         result.setdefault("summary", "")
-
         result.setdefault("duration", 0)
 
+        if not isinstance(result["articles"], list):
+            result["articles"] = []
+        if not isinstance(result["stats"], dict):
+            result["stats"] = {}
+
+        pdf_token = None
+        if pdf_bytes:
+            pdf_token = uuid.uuid4().hex
+            with jobs_lock:
+                PDF_REPORTS[pdf_token] = {
+                    "bytes": pdf_bytes,
+                    "created_at": time.time()
+                }
+
+        result["report_ready"] = bool(pdf_token)
+        result["pdf_token"] = pdf_token
+
+        with jobs_lock:
+            JOBS[job_id]["status"] = "completed"
+            JOBS[job_id]["result"] = result
+            JOBS[job_id]["completed_at"] = time.time()
 
         logger.info(
-            "Research completed: ID=%s, PDF=%s",
-            result.get("research_id"),
-            result["report_ready"]
+            "Research job %s completed. Sources=%s PDF=%s",
+            job_id, len(result["articles"]), bool(pdf_token)
         )
 
-
-        return jsonify(result)
-
-
-    except Exception as e:
-
-        logger.exception("Research failed")
-
-        return jsonify({
-            "error": str(e)
-        }), 500
-
+    except Exception as exc:
+        logger.exception("Research job %s failed", job_id)
+        with jobs_lock:
+            if job_id in JOBS:
+                JOBS[job_id]["status"] = "failed"
+                JOBS[job_id]["error"] = str(exc) or "Research failed."
+                JOBS[job_id]["completed_at"] = time.time()
 
     finally:
-
         research_lock.release()
 
 
 # =========================================================
-# PDF DOWNLOAD
+# START RESEARCH API
 # =========================================================
 
-@app.route("/api/export", methods=["POST"])
-def export():
-
+@app.route("/api/research", methods=["POST"])
+def research():
     data = request.get_json(silent=True) or {}
+    topic = str(data.get("topic", "")).strip()
 
-    research_id = data.get("research_id")
+    if not topic:
+        return jsonify({"error": "Research topic is required."}), 400
+    if len(topic) > 500:
+        return jsonify({"error": "Topic must be under 500 characters."}), 400
 
-
-    if (
-        not isinstance(research_id, int)
-        or isinstance(research_id, bool)
-        or research_id <= 0
-    ):
-
+    if not research_lock.acquire(blocking=False):
         return jsonify({
-            "error": "Invalid research ID."
-        }), 400
+            "error": "Another research task is already running. Please wait."
+        }), 409
 
+    cleanup_expired_items()
+    job_id = uuid.uuid4().hex
+
+    with jobs_lock:
+        JOBS[job_id] = {
+            "status": "running",
+            "created_at": time.time(),
+            "result": None,
+            "error": None
+        }
 
     try:
-
-        with engine.get_db() as conn:
-
-            row = conn.execute(
-                """
-                SELECT report_path
-                FROM research
-                WHERE id = ?
-                """,
-                (research_id,)
-            ).fetchone()
-
-
-        if not row or not row[0]:
-
-            return jsonify({
-                "error": "Research report not found."
-            }), 404
-
-
-        filepath = Path(row[0]).resolve()
-
-
-        # Security: PDF must be inside the reports directory.
-
-        if filepath.parent != REPORT_DIR:
-
-            logger.warning(
-                "Rejected report path outside report directory: %s",
-                filepath
-            )
-
-            return jsonify({
-                "error": "Invalid report location."
-            }), 403
-
-
-        if not filepath.is_file():
-
-            return jsonify({
-                "error": "PDF file does not exist."
-            }), 404
-
-
-        return send_file(
-            filepath,
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name=filepath.name
-        )
-
-
+        Thread(
+            target=run_research_job,
+            args=(job_id, topic),
+            daemon=True
+        ).start()
     except Exception:
+        research_lock.release()
+        with jobs_lock:
+            JOBS.pop(job_id, None)
+        logger.exception("Could not start research background thread")
+        return jsonify({"error": "Could not start the research worker."}), 500
 
-        logger.exception("PDF export failed")
-
-        return jsonify({
-            "error": "Could not download report."
-        }), 500
+    return jsonify({"job_id": job_id, "status": "running"}), 202
 
 
 # =========================================================
-# RESEARCH HISTORY
+# RESEARCH STATUS API
 # =========================================================
 
-@app.route("/api/history", methods=["GET"])
-def history():
+@app.route("/api/research/<job_id>", methods=["GET"])
+def research_status(job_id):
+    with jobs_lock:
+        job = JOBS.get(job_id)
 
-    try:
+        if not job:
+            return jsonify({
+                "error": "Research job not found or expired. Please start again."
+            }), 404
 
-        with engine.get_db() as conn:
+        if job["status"] == "completed":
+            return jsonify({
+                "status": "completed",
+                "result": job.get("result")
+            })
 
-            rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    topic,
-                    created_at,
-                    report_path
-                FROM research
-                ORDER BY id DESC
-                LIMIT 20
-                """
-            ).fetchall()
+        if job["status"] == "failed":
+            return jsonify({
+                "status": "failed",
+                "error": job.get("error") or "Research failed."
+            })
 
-
-        return jsonify([
-
-            {
-                "id": row[0],
-                "topic": row[1],
-                "created_at": row[2],
-                "has_report": bool(row[3])
-            }
-
-            for row in rows
-
-        ])
+        return jsonify({"status": "running"})
 
 
-    except Exception:
+# =========================================================
+# IN-MEMORY PDF DOWNLOAD
+# =========================================================
 
-        logger.exception("History loading failed")
+@app.route("/api/export/<token>", methods=["GET"])
+def export_pdf(token):
+    with jobs_lock:
+        report = PDF_REPORTS.get(token)
 
+    if not report:
         return jsonify({
-            "error": "Could not load research history."
-        }), 500
+            "error": "This PDF is no longer available. Run the research again."
+        }), 404
+
+    pdf_stream = io.BytesIO(report["bytes"])
+    pdf_stream.seek(0)
+
+    return send_file(
+        pdf_stream,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name="ARES_Research_Report.pdf",
+        max_age=0
+    )
 
 
 # =========================================================
@@ -1595,15 +1436,10 @@ def history():
 
 @app.route("/health", methods=["GET"])
 def health():
-
     return jsonify({
-
         "application": "ARES",
-
         "version": getattr(engine, "VERSION", "unknown"),
-
         "status": "online"
-
     })
 
 
@@ -1613,18 +1449,12 @@ def health():
 
 @app.errorhandler(413)
 def request_too_large(error):
-
-    return jsonify({
-        "error": "Request payload is too large."
-    }), 413
+    return jsonify({"error": "Request payload is too large."}), 413
 
 
 @app.errorhandler(404)
 def not_found(error):
-
-    return jsonify({
-        "error": "Endpoint not found."
-    }), 404
+    return jsonify({"error": "Endpoint not found."}), 404
 
 
 # =========================================================
@@ -1632,9 +1462,8 @@ def not_found(error):
 # =========================================================
 
 if __name__ == "__main__":
-
     app.run(
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
         debug=False,
         threaded=True
